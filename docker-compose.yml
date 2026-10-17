@@ -1,0 +1,85 @@
+name: wagering
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://wagering:wagering@postgres:5432/wagering
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  SQS_ENDPOINT: http://localstack:4566
+  LOG_LEVEL: info
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:3.8.1
+    environment:
+      SERVICES: sqs
+      # URL da fila baseada no host da requisição: funciona tanto de dentro
+      # do compose (localstack:4566) quanto do host (localhost:4566)
+      SQS_ENDPOINT_STRATEGY: path
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./docker/create-queues.sh:/etc/localstack/init/ready.d/create-queues.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wagering-events.fifo"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    build: .
+    command: ["bun", "run", "src/infra/database/migrate.ts", "up"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    environment:
+      <<: *app-env
+      APP_ROLE: api
+    deploy:
+      replicas: 3
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
+
+  worker:
+    build: .
+    environment:
+      <<: *app-env
+      APP_ROLE: worker
+    deploy:
+      replicas: 3
+    stop_grace_period: 40s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
+
+  gateway:
+    image: nginx:1.27-alpine
+    ports:
+      - "3000:80"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
